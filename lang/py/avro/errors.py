@@ -114,6 +114,10 @@ class UnsupportedCodec(NotImplementedError, AvroException):
     """Raised when the compression named cannot be used."""
 
 
+class UnsupportedChecksum(NotImplementedError, AvroException):
+    """Raised when the named checksum algorith cannot be used."""
+
+
 class UsageError(RuntimeError, AvroException):
     """An exception raised when incorrect arguments were passed."""
 

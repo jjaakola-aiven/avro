@@ -26,8 +26,9 @@ import io
 import json
 import warnings
 from types import TracebackType
-from typing import IO, AnyStr, BinaryIO, MutableMapping, Optional, Type, cast
+from typing import IO, Any, AnyStr, BinaryIO, Dict, MutableMapping, Optional, Type, cast
 
+import avro.checksums
 import avro.codecs
 import avro.errors
 import avro.io
@@ -55,13 +56,36 @@ META_SCHEMA = cast(
         )
     ),
 )
-
+CHECKSUM_DOC = (
+    "The checksum is represented as bytes. This is required to accomodate e.g. unsigned long. CRC32 and xxhash are in the big endian byte order."
+)
+BLOCK_HEADER_SCHEMA = avro.schema.parse(
+    json.dumps(
+        {
+            "type": "record",
+            "name": "org.apache.avro.file.block.Header",
+            "fields": [
+                {"name": "blocks", "type": "long"},
+                {"name": "uncompressed_length", "type": "long"},
+                {"name": "checksum_algorithm", "type": ["string", "null"], "default": None},
+                {"name": "checksum", "type": ["bytes", "null"], "default": None, "doc": CHECKSUM_DOC},
+            ],
+        }
+    )
+)
 NULL_CODEC = "null"
 VALID_CODECS = avro.codecs.KNOWN_CODECS.keys()
 VALID_ENCODINGS = ["binary"]  # not used yet
+VALID_CHECKSUM_ALGORITHMS = avro.checksums.KNOWN_CHECKSUMS.keys()
 
 CODEC_KEY = "avro.codec"
 SCHEMA_KEY = "avro.schema"
+CHECKSUM_KEY = "avro.checksum"
+
+# Block header marker. The marker is written where the block count was written in previous
+# version of the format. The block count must be greater than 0 in the previous format.
+# Therefore the marker value is selected as negative value, -1.
+BLOCK_HEADER_MAGIC_MARKER = -1
 
 
 class HeaderType(TypedDict):
@@ -153,6 +177,7 @@ class DataFileWriter(_DataFileMetadata):
         "_writer",
         "block_count",
         "sync_marker",
+        "checksum_algorithm",
     )
 
     _buffer_encoder: avro.io.BinaryEncoder
@@ -163,9 +188,15 @@ class DataFileWriter(_DataFileMetadata):
     _writer: IO[bytes]
     block_count: int
     sync_marker: bytes
+    checksum_algorithm: Optional[str]
 
     def __init__(
-        self, writer: IO[AnyStr], datum_writer: avro.io.DatumWriter, writers_schema: Optional[avro.schema.Schema] = None, codec: str = NULL_CODEC
+        self,
+        writer: IO[AnyStr],
+        datum_writer: avro.io.DatumWriter,
+        writers_schema: Optional[avro.schema.Schema] = None,
+        codec: str = NULL_CODEC,
+        checksum_algorithm: Optional[str] = None,
     ) -> None:
         """If the schema is not present, presume we're appending."""
         if hasattr(writer, "mode") and "b" not in writer.mode:
@@ -187,6 +218,7 @@ class DataFileWriter(_DataFileMetadata):
             # collect metadata
             self.sync_marker = dfr.sync_marker
             self.codec = dfr.codec
+            self.checksum_algorithm = dfr.checksum_algorithm
 
             # get schema used to write existing file
             self.schema = schema_from_file = dfr.schema
@@ -198,6 +230,7 @@ class DataFileWriter(_DataFileMetadata):
             return
         self.sync_marker = randbytes(16)
         self.codec = codec
+        self.checksum_algorithm = checksum_algorithm
         self.schema = str(writers_schema)
         self.datum_writer.writers_schema = writers_schema
 
@@ -226,30 +259,56 @@ class DataFileWriter(_DataFileMetadata):
         self.datum_writer.write_data(META_SCHEMA, header, self.encoder)
         self._header_written = True
 
+    def _write_block_header(self, uncompressed_data: bytes):
+        # Write number of items in block.
+        # Write length of block.
+        block_header: Dict[str, Any] = {
+            "blocks": self.block_count,
+            "uncompressed_length": len(uncompressed_data),
+            "checksum_algorithm": self.checksum_algorithm,
+        }
+
+        # If checksum enabled, write checksum.
+        if self.checksum_algorithm is not None:
+            checksum = avro.checksums.get_checksum(self.checksum_algorithm)
+            block_checksum_value = checksum.calculate(uncompressed_data)
+            block_header.update(
+                {
+                    "checksum": block_checksum_value,
+                }
+            )
+        self.datum_writer.write_data(BLOCK_HEADER_SCHEMA, block_header, self.encoder)
+
     # TODO(hammer): make a schema for blocks and use datum_writer
     def _write_block(self) -> None:
         if not self._header_written:
             self._write_header()
 
         if self.block_count > 0:
-            # write number of items in block
-            self.encoder.write_long(self.block_count)
-
-            # write block contents
+            # Compress block contents.
             uncompressed_data = self.buffer_writer.getvalue()
             codec = avro.codecs.get_codec(self.codec)
             compressed_data, compressed_data_length = codec.compress(uncompressed_data)
 
-            # Write length of block
+            # This is the spot where previous implementation wrote the block count.
+            # On the reader this can server as a marker to read the block header or to
+            # read the block as it was earlier. As the blocks must be positive for the
+            # old implementation the marker shall be -1.
+            self.encoder.write_long(BLOCK_HEADER_MAGIC_MARKER)
+
+            # Write block header.
+            self._write_block_header(uncompressed_data)
+
+            # Write compressed data length.
             self.encoder.write_long(compressed_data_length)
 
-            # Write block
+            # Write block.
             self.writer.write(compressed_data)
 
-            # write sync marker
+            # Write sync marker.
             self.writer.write(self.sync_marker)
 
-            # reset buffer
+            # Reset buffer.
             self.buffer_writer.truncate(0)
             self.buffer_writer.seek(0)
             self.block_count = 0
@@ -302,6 +361,7 @@ class DataFileReader(_DataFileMetadata):
         "_reader",
         "block_count",
         "sync_marker",
+        "checksum_algorithm",
     )
     _datum_decoder: Optional[avro.io.BinaryDecoder]
     _datum_reader: avro.io.DatumReader
@@ -310,6 +370,7 @@ class DataFileReader(_DataFileMetadata):
     _reader: IO[bytes]
     block_count: int
     sync_marker: bytes
+    checksum_algorithm: Optional[str]
 
     # TODO(hammer): allow user to specify expected schema?
     # TODO(hammer): allow user to specify the encoder
@@ -322,6 +383,7 @@ class DataFileReader(_DataFileMetadata):
         self._raw_decoder = avro.io.BinaryDecoder(bytes_reader)
         self._datum_decoder = None  # Maybe reset at every block.
         self._datum_reader = datum_reader
+        self.checksum_algorithm = None
 
         # read the header: magic, meta, sync
         self._read_header()
@@ -381,9 +443,31 @@ class DataFileReader(_DataFileMetadata):
         self.sync_marker = header["sync"]
 
     def _read_block_header(self) -> None:
-        self.block_count = self.raw_decoder.read_long()
-        codec = avro.codecs.get_codec(self.codec)
-        self._datum_decoder = codec.decompress(self.raw_decoder)
+        header_marker_or_block_count = self.raw_decoder.read_long()
+        if header_marker_or_block_count > BLOCK_HEADER_MAGIC_MARKER:
+            # Previous format, marker contains the number of blocks.
+            self.block_count = header_marker_or_block_count
+            codec = avro.codecs.get_codec(self.codec)
+            self._datum_decoder = codec.decompress(self.raw_decoder)
+        else:
+            # Current format with block header.
+            block_header: Dict[str, Any] = cast(
+                Dict[str, Any], self.datum_reader.read_data(BLOCK_HEADER_SCHEMA, BLOCK_HEADER_SCHEMA, self.raw_decoder)
+            )
+            self.block_count = block_header["blocks"]
+            codec = avro.codecs.get_codec(self.codec)
+            self._datum_decoder = codec.decompress(self.raw_decoder)
+
+            if "checksum_algorithm" in block_header and block_header.get("checksum") is not None:
+                pos = self._datum_decoder.reader.tell()
+                data = self._datum_decoder.reader.read(cast(int, block_header.get("uncompressed_length")))
+                checksum = avro.checksums.get_checksum(block_header["checksum_algorithm"])
+                calculated_checksum = checksum.calculate(data)
+                self._datum_decoder.reader.seek(pos)
+                if block_header["checksum"] != calculated_checksum:
+                    raise avro.errors.DataFileException(
+                        f"DataFile block corrupted, checksum mismatch (recorded: {block_header['checksum']!r} != calculated {calculated_checksum!r})"
+                    )
 
     def _skip_sync(self) -> bool:
         """
@@ -405,6 +489,7 @@ class DataFileReader(_DataFileMetadata):
 
         if self.datum_decoder is None:
             raise avro.errors.DataFileException("DataFile is not ready to read because it has no decoder")
+
         datum = self.datum_reader.read(self.datum_decoder)
         self.block_count -= 1
         return datum

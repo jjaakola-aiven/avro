@@ -464,15 +464,37 @@ A file header is thus described by the following schema:
   ]
 }
 ```
-      
+
 A file data block consists of:
 
-* A long indicating the count of objects in this block.
+* A long indicating the count of objects in this block for datafiles prior to Avro 1.12.0 or a magic `-1` for indicating newer version which has a block header.
+* A block header
 * A long indicating the size in bytes of the serialized objects in the current block, after any codec is applied
 * The serialized objects. If a codec is specified, this is compressed by that codec.
 * The file's 16-byte sync marker.
 
-A file data block is thus described by the following schema:
+A file data block or Avro >= 1.12.0 is thus described by the following schema:
+```json
+{"type": "record", "name": "org.apache.avro.file.DataBlock",
+ "fields" : [
+   {"type": "record", "name": "org.apache.avro.file.block.Header",
+    "fields": [
+      {"name": "blocks", "type": "long"},
+      {"name": "uncompressed_length", "type": "long"},
+      {"name": "checksum_algorithm", "type": ["string", "null"], "default": null},
+      {"name": "checksum", "type": ["bytes", "null"], "default": null, "doc": "..."},
+    ]},
+   {"name": "count", "type": "long"},
+   {"name": "data", "type": "bytes"},
+   {"name": "sync", "type": {"type": "fixed", "name": "Sync", "size": 16}}
+  ]
+}
+```
+
+Each block's binary data can be efficiently extracted or skipped without deserializing the contents. The checksum in the block header enables detection of corrupt blocks and help ensure data integrity. The checksum algorithm is stored in the `checksum_algorithm` field and checksum is stored as bytes. The checksum is calculated on uncompressed data. Depending on the checksum algorithm the byte order can vary. For standard `crc32` and `xxhash` implementations the byte order is big endian. The checksum and algorithm fields are optional and by default checksums are not calculated.
+
+
+A file data block for Avro < 1.12.0 is thus described by the following schema:
 ```json
 {"type": "record", "name": "org.apache.avro.file.DataBlock",
  "fields" : [
